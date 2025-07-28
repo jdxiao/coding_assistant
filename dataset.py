@@ -34,8 +34,6 @@ def load_leetcode_dataset(split="train", num_problems=None, cache_dir=None):
         return None
 
 if __name__ == "__main__":
-    # This block will only run if you execute this file directly (e.g., python src/dataset_manager.py)
-    # It's useful for testing this module in isolation.
 
     print("Loading dataset...")
 
