@@ -1,13 +1,20 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
+# LLMInterface class to load and interact with a pre-trained language model
 class LLMInterface:
-    def __init__(self, model_name: str = "bigcode/starcoderbase-7b", device: str = None):
+
+    # Initializes the LLM interface with a pre-trained model and tokenizer.
+    def __init__(self, model_name: str = "bigcode/starcoderbase-1b", device: str = None):
         """
         Initializes the LLM interface with a pre-trained model and tokenizer.
+        Args:
+            model_name (str): The name of the pre-trained model to load.
+            device (str): The device to load the model on. If None, it will use
         """
         self.model_name = model_name
 
+        # Device selection
         if device:
             self.device = device
         elif torch.cuda.is_available():
@@ -15,32 +22,34 @@ class LLMInterface:
         else:
             self.device = "cpu"
         
-        print(f"Loading tokenizer for '{model_name}'...")
+        # Load the model and tokenizer
+        print(f"Loading tokenizer for '{model_name}'.")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         print("Tokenizer loaded.")
 
         print(f"Loading model '{model_name}' to device: {self.device}...")
-        
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16).to(self.device)
-        except RuntimeError as e:
-            if "device-side assert" in str(e) or "Expected bfloat16" in str(e):
-                print("\nWARNING: bfloat16 might not be supported by your GPU or PyTorch setup.")
-                print("Attempting to load in float16 (half precision) instead.")
-                self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16).to(self.device)
-            else:
-                raise e
-        
-        print("Model loaded.")
-
+    
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            torch_dtype=torch.float16
+        ).to(self.device)
+ 
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
             print(f"Set tokenizer.pad_token_id to tokenizer.eos_token_id: {self.tokenizer.eos_token_id}")
 
-    def generate_response(self, prompt: str, max_new_tokens: int = 512, temperature: float = 0.7) -> str:
+    # Generates a prompt for code generation based on the problem description and target language.
+    def generate_response(self, prompt: str, max_new_tokens: int = 512, temperature: float = 0.7):
         """
         Generates a text response from the loaded LLM based on the given prompt.
+        Args:
+            prompt (str): The input prompt to generate a response for.
+            max_new_tokens (int): The maximum number of new tokens to generate.
+            temperature (float): The temperature for sampling. Higher values mean more randomness.
+        Returns:
+            str: The generated text response from the model.
         """
+
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
         with torch.no_grad():
@@ -54,22 +63,33 @@ class LLMInterface:
         
         generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         
+        # Remove the prompt part from the generated text, if it exists
         if generated_text.startswith(prompt):
             generated_text = generated_text[len(prompt):].strip()
 
         return generated_text
 
-    def parse_llm_output(self, raw_output: str) -> tuple[str, str]:
+
+    def parse_llm_output(self, raw_output: str, target_language: str = "python"):
         """
         Parses the raw LLM output to extract code and explanation based on expected markdown format.
+        Args:
+            raw_output (str): The raw output text from the LLM.
+            target_language (str): The programming language of the solution code. Default is "python".
+        Returns:
+            tuple: A tuple containing the extracted code and explanation.
         """
-        code_start_tag = "```python" # Assuming Python as the target language for code blocks
+
+        code_start_tag = f"```{target_language}"  # Python by default
         code_end_tag = "```"
 
         code = ""
         explanation = ""
 
+        # Check if the raw output contains the code block
         code_start_index = raw_output.find(code_start_tag)
+
+        # If the code block is found, extract the code and explanation
         if code_start_index != -1:
             code_content_start = code_start_index + len(code_start_tag)
             code_end_index = raw_output.find(code_end_tag, code_content_start)
@@ -82,6 +102,7 @@ class LLMInterface:
         
         return code, explanation
 
+# For file testing purposes
 if __name__ == "__main__":
     try:
         from prompt import generation_prompt
@@ -92,7 +113,7 @@ if __name__ == "__main__":
     print("Testing LLMInterface (Base Model Loading and Basic Generation)")
 
     try:
-        llm_agent = LLMInterface() # Uses default StarCoder model (bigcode/starcoderbase-7b)
+        llm_agent = LLMInterface() # Uses default StarCoder model (bigcode/starcoderbase-1b)
     except Exception as e:
         print(f"\nFailed to initialize LLMInterface: {e}")
         exit()
