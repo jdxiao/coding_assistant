@@ -9,22 +9,22 @@ from llm import LLMInterface
 # Class to fine-tune using LoRA adapters
 class CodeGeneratorFinetuner: 
     def __init__(self, 
-                 model_name: str = "bigcode/starcoderbase-1b",
-                 dataset_name_hf: str = "greengerong/leetcode", 
-                 output_dir: str = "./lora_adapters",
-                 per_device_train_batch_size: int = 1, 
-                 gradient_accumulation_steps: int = 8, 
-                 warmup_steps: int = 2,
-                 max_steps: int = 10,  # small number for testing
-                 learning_rate: float = 2e-4,
-                 fp16: bool = False, 
-                 bf16: bool = True,  
-                 num_train_epochs: float = 1.0, 
-                 lora_r: int = 16,
-                 lora_alpha: int = 32,
-                 lora_dropout: float = 0.05,
-                 push_to_hub: bool = False,
-                 target_languages: list = ["python", "c++", "java"],
+                 model_name = "bigcode/starcoderbase-1b",
+                 dataset_name_hf = "greengerong/leetcode", 
+                 output_dir  = "./lora_adapters",
+                 per_device_train_batch_size = 1, 
+                 gradient_accumulation_steps = 8, 
+                 warmup_steps = 2,
+                 max_steps = 10,  # small number for testing
+                 learning_rate = 2e-4,
+                 fp16 = False, 
+                 bf16 = True,  
+                 num_train_epochs = 1.0, 
+                 lora_r = 16,
+                 lora_alpha = 32,
+                 lora_dropout = 0.05,
+                 push_to_hub = False,
+                 target_languages = ["python", "c++", "java"],
                 ):
         
         # Initialize parameters for fine-tuning
