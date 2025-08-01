@@ -1,7 +1,7 @@
 from datasets import load_dataset
 import os
 
-def load_leetcode_dataset(split="train", num_problems=None, cache_dir=None):
+def load_leetcode_dataset(split="train", num_problems=10, cache_dir=None):
     """
     Loads a subset of the greengerong/leetcode dataset from Hugging Face.
     This dataset contains algorithmic problems and their solutions.
