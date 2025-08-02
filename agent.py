@@ -2,7 +2,6 @@ import json
 import io
 import sys
 import contextlib
-from typing import Any, List, Dict
 
 # The maximum time a function is allowed to run for a single test case
 TIMEOUT = 5

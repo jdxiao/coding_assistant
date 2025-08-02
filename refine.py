@@ -3,6 +3,64 @@ from llm import LLMInterface
 from agent import execute_code
 from prompt import generation_prompt
 import sys
+from dataset import load_leetcode_dataset
+
+def generate_test_cases_with_outputs(llm, problem_content: str, solution_code: str, function_name: str) -> list:
+    """
+    Generates test case inputs using the LLM, then uses the correct solution
+    to produce the expected outputs.
+
+    Args:
+        llm (LLMInterface): The LLM interface object.
+        problem_content (str): The problem description.
+        solution_code (str): The correct solution code from the dataset.
+        function_name (str): The name of the function to be tested.
+
+    Returns:
+        list: A list of dictionaries representing test cases with inputs and expected outputs.
+    """
+    print("Generating test case inputs using the LLM...")
+    
+    prompt = f"""
+        Given the following programming problem:
+        {problem_content}
+
+        Please generate at least 3 diverse test case inputs for this problem. Provide the output as a
+        JSON array of lists, where each list contains the arguments for the function call.
+        For example, if the function takes one argument, your output might look like:
+        [[1], [2], [3]]
+        If it takes two arguments, it might be:
+        [[1, 2], [3, 4], [5, 6]]
+
+        JSON Output:
+        """
+    try:
+        response_json = llm.generate_response(prompt)
+        test_case_inputs = json.loads(response_json)
+        
+        print("Generated test case inputs. Now executing the correct solution to get expected outputs.")
+        
+        test_cases_with_outputs = []
+        for inputs in test_case_inputs:
+            # Function inputs should be a tuple for execution
+            inputs_tuple = tuple(inputs) if isinstance(inputs, list) else (inputs,)
+            
+            execution_results = execute_code(solution_code, function_name, [{"input": inputs_tuple, "expected_output": None}])
+            
+            if execution_results["success"] and execution_results["test_results"]:
+                test_cases_with_outputs.append({
+                    "input": inputs_tuple,
+                    "expected_output": execution_results["test_results"][0]["actual_output"]
+                })
+            else:
+                print(f"Error executing correct solution with input: {inputs}. Skipping this test case.")
+                continue
+        
+        return test_cases_with_outputs
+
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"Failed to generate or parse test case inputs: {e}")
+        return []
 
 def run_refinement_pipeline(llm, problem_content: str, function_name: str, test_cases: list):
     """
@@ -20,9 +78,11 @@ def run_refinement_pipeline(llm, problem_content: str, function_name: str, test_
     print("Attempting to solve the problem:")
     print(f"Problem content: {problem_content[:100]}...")
     
-    # Initial solution generation
+    # Initial code generation
     initial_prompt = generation_prompt(problem_content, target_language="python")
-    current_solution = llm.generate_solution(initial_prompt)
+    initial_raw_output = llm.generate_response(initial_prompt)
+    current_solution, _ = llm.parse_llm_output(initial_raw_output)
+    
     print("\nInitial Solution Generated:")
     print(current_solution)
     
@@ -30,10 +90,11 @@ def run_refinement_pipeline(llm, problem_content: str, function_name: str, test_
     refinement_attempt = 0
     while True:
         refinement_attempt += 1
-        print(f"\nRunning test for refinement attempt {refinement_attempt}")
+        print(f"\n--- Running test for refinement attempt {refinement_attempt} ---")
         
         execution_results = execute_code(current_solution, function_name, test_cases)
         
+        # Check if all tests passed
         if execution_results["success"]:
             print("Code executed successfully and all tests passed!")
             print(f"Final solution:\n{current_solution}")
@@ -43,13 +104,13 @@ def run_refinement_pipeline(llm, problem_content: str, function_name: str, test_
             error_message = json.dumps(execution_results, indent=2)
             print(f"Error Message:\n{error_message}")
             
-            # Ask user if they want to refine the solution
             user_choice = input("Would you like to refine the solution? (yes/no): ").lower().strip()
             
             if user_choice != 'yes':
                 print("Refinement process stopped by user. Giving up on this problem.")
                 break
             
+            # Generate a refinement prompt
             print("Refining solution...")
             refinement_prompt = f"""
                 Given the following programming problem:
@@ -68,21 +129,22 @@ def run_refinement_pipeline(llm, problem_content: str, function_name: str, test_
                 ```python
                 """
             
-            # Generate a refined solution using the LLM
-            current_solution = llm.generate_solution(refinement_prompt)
+            # Generate the refined solution
+            refined_raw_output = llm.generate_response(refinement_prompt)
+            current_solution, _ = llm.parse_llm_output(refined_raw_output)
+
             print("\nRefined Solution Generated:")
             print(current_solution)
 
+
 def main():
     """
-    Main function to run the dynamic code generation and refinement pipeline.
-    Using a sample problem and test cases for demonstration.
+    Main function for the dataset-driven pipeline.
     """
     # Configuration
     model_name = "bigcode/starcoderbase-1b"
     lora_adapters_path = "./lora_adapters"
     
-    # Load the LLM with the fine-tuned adapters
     try:
         llm = LLMInterface(model_name=model_name, lora_adapters_path=lora_adapters_path)
     except Exception as e:
@@ -90,39 +152,32 @@ def main():
         print("Please make sure you have run finetune.py successfully and the adapters exist.")
         sys.exit(1)
 
-    # Example usage
-    print("Welcome to the code generation assistant.")
-    print("Provide a problem and test cases to run the pipeline.")  # User input disabled for now
+    print("Welcome to the code generation and interactive refinement pipeline.")
+    print("Loading a small sample of the dataset...")
+    test_dataset = load_leetcode_dataset(num_problems=2)
 
-    # A sample problem for demonstration
-    sample_problem = """
-        Write a Python function `find_max(numbers)` that takes a list of 
-        numbers and returns the largest number in the list. Assume the list is not empty.
-        """
-    # Test cases for the sample problem
-    sample_test_cases = [
-        {"input": ([1, 5, 2, 8],), "expected_output": 8},
-        {"input": ([100, 20, 30],), "expected_output": 100},
-        {"input": ([7],), "expected_output": 7}
-    ]
+    if not test_dataset:
+        print("Failed to load dataset. Please ensure the dataset loader is working.")
+        return
 
-    while True:
-        # Get user input
-        user_choice = input("Would you like to run the sample problem? (yes/no): ").lower().strip()
+    for i, problem_data in enumerate(test_dataset):
+        problem_content = problem_data.get('content')
+        function_name = problem_data.get("function_name", "solve")
+        correct_solution_code = problem_data.get('python')
+
+        if not problem_content or not correct_solution_code:
+            print(f"Skipping problem {i+1}: Missing content or correct solution.")
+            continue
         
-        if user_choice == 'yes':
-            problem_to_solve = sample_problem
-            test_cases_to_use = sample_test_cases
-            function_name_to_use = "find_max"
-            run_refinement_pipeline(llm, problem_to_solve, function_name_to_use, test_cases_to_use)
-        elif user_choice == 'no':
-            print("You can edit the script to provide your own problem and test cases.")
-            break
-        else:
-            print("Invalid input. Please enter 'yes' or 'no'.")
+        test_cases = generate_test_cases_with_outputs(llm, problem_content, correct_solution_code, function_name)
+
+        if not test_cases:
+            print(f"Skipping problem {i+1}: Failed to generate valid test cases.")
+            continue
         
-        # Ask if the user wants to continue
-        continue_choice = input("Run another problem? (yes/no): ").lower().strip()
+        run_refinement_pipeline(llm, problem_content, function_name, test_cases)
+        
+        continue_choice = input("Continue to the next problem? (yes/no): ").lower().strip()
         if continue_choice != 'yes':
             break
 
