@@ -3,7 +3,7 @@ from transformers import AutoTokenizer, TrainingArguments, Trainer
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 from dataset import load_leetcode_dataset
-from prompt import generation_prompt
+from prompt import generation_prompt, explanation_prompt
 from llm import LLMInterface
 
 class CodeGeneratorFinetuner: 
@@ -14,10 +14,10 @@ class CodeGeneratorFinetuner:
                  per_device_train_batch_size: int = 1, 
                  gradient_accumulation_steps: int = 8, 
                  warmup_steps: int = 2,
-                 max_steps: int = 10, 
+                 max_steps: int = 5, 
                  learning_rate: float = 2e-4,
                  fp16: bool = False, 
-                 bf16: bool = True,   
+                 bf16: bool = True,  
                  num_train_epochs: float = 1.0, 
                  lora_r: int = 16,
                  lora_alpha: int = 32,
@@ -57,9 +57,9 @@ class CodeGeneratorFinetuner:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         print("Tokenizer loaded.")
         
-        print(f"Initializing LLMInterface to load base model for fine-tuning...")
-        llm_interface_instance = LLMInterface(model_name=model_name, device=self.device)
-        self.model = llm_interface_instance.model
+        print(f"Initializing LLMInterface to load base model and parse data...")
+        self.llm_interface = LLMInterface(model_name=model_name, device=self.device)
+        self.model = self.llm_interface.model
         
         self.model.gradient_checkpointing_enable() 
         self.model = prepare_model_for_kbit_training(self.model)
@@ -78,6 +78,7 @@ class CodeGeneratorFinetuner:
         self.model.print_trainable_parameters() 
 
         print(f"Loading dataset from {self.dataset_name_hf} split 'train'...")
+        # Limiting to a small number of problems for a quick demo
         raw_train_dataset = load_leetcode_dataset(split="train", num_problems=10) 
         if raw_train_dataset is None:
             raise ValueError("Failed to load training dataset. Please check src/dataset.py and your internet connection.")
@@ -85,46 +86,62 @@ class CodeGeneratorFinetuner:
         print("Dataset loaded. Applying preprocessing...")
         
         def preprocess_function(examples):
-            # Only handles a single language (Python) for now
             tokenized_examples = []
             
             for i in range(len(examples["content"])):
                 problem_content = examples["content"][i]
                 
-                # Directly check if a Python solution exists for this problem
                 if "python" in examples and examples["python"][i]:
-                    solution_code = examples["python"][i]
-                    instruction_prompt = generation_prompt(problem_content, target_language="python")
+                    raw_solution_with_explanation = examples["python"][i]
                     
-                    # Format the full text and tokenize it
-                    full_text = f"{instruction_prompt}\n```python\n{solution_code}\n```{self.tokenizer.eos_token}"
-                    tokenized_input = self.tokenizer(
-                        full_text,
-                        max_length=1024,
-                        truncation=True,
-                        padding="max_length",
-                        return_tensors="pt"
-                    )
+                    # Split the solution and explanation using parsing function
+                    solution_code, explanation = self.llm_interface.parse_llm_output(raw_solution_with_explanation)
                     
-                    # Create labels by cloning the input IDs
-                    labels = tokenized_input["input_ids"].clone()
-                    
-                    # Mask the prompt part so the model only learns from the solution
-                    prompt_tokens = self.tokenizer(instruction_prompt, truncation=True)["input_ids"]
-                    prompt_len = len(prompt_tokens)
-                    labels[:, :prompt_len] = -100
-                    
-                    # Add the labels to the tokenized input dictionary
-                    tokenized_input["labels"] = labels
-                    tokenized_examples.append(tokenized_input)
+                    if solution_code and explanation:
+                        # Create a training example for code generation
+                        instruction_prompt_code = generation_prompt(problem_content, target_language="python")
+                        full_text_code = f"{instruction_prompt_code}\n```python\n{solution_code}\n```{self.tokenizer.eos_token}"
+                        tokenized_input_code = self.tokenizer(
+                            full_text_code,
+                            max_length=1024,
+                            truncation=True,
+                            padding="max_length",
+                            return_tensors="pt"
+                        )
+                        labels_code = tokenized_input_code["input_ids"].clone()
+                        prompt_tokens_code = self.tokenizer(instruction_prompt_code, truncation=True)["input_ids"]
+                        labels_code[:, :len(prompt_tokens_code)] = -100
+                        tokenized_input_code["labels"] = labels_code
+                        tokenized_examples.append(tokenized_input_code)
+
+                        # Create a training example for explanation generation
+                        instruction_prompt_explanation = explanation_prompt(problem_content, solution_code)
+                        full_text_explanation = f"{instruction_prompt_explanation}\n{explanation}\n{self.tokenizer.eos_token}"
+                        tokenized_input_explanation = self.tokenizer(
+                            full_text_explanation,
+                            max_length=1024,
+                            truncation=True,
+                            padding="max_length",
+                            return_tensors="pt"
+                        )
+                        labels_explanation = tokenized_input_explanation["input_ids"].clone()
+                        prompt_tokens_explanation = self.tokenizer(instruction_prompt_explanation, truncation=True)["input_ids"]
+                        labels_explanation[:, :len(prompt_tokens_explanation)] = -100
+                        tokenized_input_explanation["labels"] = labels_explanation
+                        tokenized_examples.append(tokenized_input_explanation)
             
             # Combine all tokenized examples into a single dictionary
             if not tokenized_examples:
                 return {}
             
+            combined_dict = {key: [] for key in tokenized_examples[0].keys()}
+            for example in tokenized_examples:
+                for key in combined_dict:
+                    combined_dict[key].append(example[key])
+            
             return {
-                key: torch.cat([ex[key] for ex in tokenized_examples], dim=0) 
-                for key in tokenized_examples[0].keys()
+                key: torch.cat(combined_dict[key], dim=0) 
+                for key in combined_dict.keys()
             }
 
         self.tokenized_train_dataset = raw_train_dataset.map( 
@@ -157,7 +174,6 @@ class CodeGeneratorFinetuner:
             tokenizer=self.tokenizer, 
         )
 
-
     def train(self):
         """
         Starts the fine-tuning process.
@@ -173,14 +189,15 @@ class CodeGeneratorFinetuner:
             self.trainer.push_to_hub(commit_message="Initial LoRA adapters training")
             print("LoRA adapters pushed to Hub.")
 
+
 if __name__ == "__main__":
-    print("--- Starting Code Generator Fine-tuning Script ---")
+    print("Starting Code Generator Fine-tuning Script")
 
     trainer_config = {
         "output_dir": "./lora_adapters", 
         "per_device_train_batch_size": 1, 
         "gradient_accumulation_steps": 2, 
-        "max_steps": 10, 
+        "max_steps": 5, 
         "learning_rate": 2e-4,
         "bf16": True if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else False, 
         "fp16": True if torch.cuda.is_available() and not (torch.cuda.is_bf16_supported()) else False, 
