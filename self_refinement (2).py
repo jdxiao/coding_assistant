@@ -7,6 +7,35 @@ Original file is located at
     https://colab.research.google.com/drive/1Tf4pQuBhwiOr9-9dvP_r_5U01zKN_ZQS
 """
 
+def self_refine_until_success(problem_text, model, tokenizer, max_loops=3, max_new_tokens=300):
+    prompt = f"### Problem:\n{problem_text}\n\n### Please solve this problem in Python."
+    current_prompt = prompt
+    for attempt in range(max_loops):
+        inputs = tokenizer(current_prompt, return_tensors="pt").to(model.device)
+        output = model.generate(
+            inputs.input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=0.2,
+            pad_token_id=tokenizer.eos_token_id
+        )
+        code = tokenizer.decode(output[0], skip_special_tokens=True)
+
+        try:
+            exec(code, {})
+            print(f"Success on attempt {attempt + 1}")
+            return code
+        except Exception as e:
+            error_message = str(e)
+            print(f"Error on attempt {attempt + 1}: {error_message}")
+            current_prompt = (
+                f"{prompt}\n\n"
+                f"### Previous code:\n{code}\n\n"
+                f"### Error message:\n{error_message}\n\n"
+                f"Please refine the code to fix the above error and improve readability if possible."
+            )
+
+    return code
+
 def construct_prompt(problem_text, problem_type=None):
     base_prompt = f"""### Problem
 {problem_text}
@@ -41,7 +70,7 @@ def analyze_generated_code(code):
 
 # Login to Hugging Face Hub (replace with your own token)
 from huggingface_hub import login
-login(token="hf_xxx...")  # replace with your own token  # Token removed for security  # ← replace with your real token
+login(token="your_token_here")  # replace with your own token  # Token removed for security  # ← replace with your real token
 
 # Load necessary libraries
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -277,3 +306,6 @@ Prompt design has a direct impact on both code correctness and explainability. M
 
 """
 
+problem_text = train_dataset[0]['content']
+final_code = self_refine_until_success(problem_text, model, tokenizer)
+print("\nFinal Code:\n", final_code)
