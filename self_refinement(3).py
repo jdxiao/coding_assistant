@@ -70,7 +70,7 @@ def analyze_generated_code(code):
 
 # Login to Hugging Face Hub (replace with your own token)
 from huggingface_hub import login
-login(token="your_token_here")  # replace with your own token  # Token removed for security  # ← replace with your real token
+login(token="hf_xxx...")  # replace with your own token  # Token removed for security  # ← replace with your real token
 
 # Load necessary libraries
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -309,3 +309,325 @@ Prompt design has a direct impact on both code correctness and explainability. M
 problem_text = train_dataset[0]['content']
 final_code = self_refine_until_success(problem_text, model, tokenizer)
 print("\nFinal Code:\n", final_code)
+
+import pandas as pd
+
+
+prompt_results = [
+    {"Prompt": "v1_basic", "Comments": 16, "Docstring": "No", "Plan-then-Code": "No"},
+    {"Prompt": "v2_docstring", "Comments": 21, "Docstring": "Yes", "Plan-then-Code": "No"},
+    {"Prompt": "v3_plan_then_code", "Comments": 2, "Docstring": "No", "Plan-then-Code": "Yes"}
+]
+
+df = pd.DataFrame(prompt_results)
+display(df)
+
+
+df.to_csv("prompt_comparison.csv", index=False)
+
+
+
+# =========================
+# Metrics pipeline (English)
+# =========================
+#
+# What it does:
+# 1) Uses StarCoder to generate code for the Two Sum problem under 3 prompt styles.
+# 2) Runs unit tests, then triggers a simple self-refinement step if tests fail.
+# 3) Computes metrics for initial vs refined code:
+#    - pass_rate (fraction of tests passed)
+#    - comment_density (#comment lines / #non-empty lines)
+#    - has_docstring (True/False)
+#    - loc (non-empty lines of code)
+# 4) Saves a CSV and draws two charts.
+
+import re
+import time
+import json
+import textwrap
+from typing import List, Dict, Tuple
+
+import torch
+import pandas as pd
+import matplotlib.pyplot as plt
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# ---------------------
+# 0) Model preparation
+# ---------------------
+MODEL_NAME = "bigcode/starcoder2-3b"   # change if needed
+DEVICE_MAP = "auto"
+DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
+
+print("Loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+
+print("Loading model...")
+t0 = time.time()
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    device_map=DEVICE_MAP,
+    torch_dtype=DTYPE,
+)
+model.eval()
+print(f"Model loaded in {time.time()-t0:.2f}s.")
+
+# ----------------------------
+# 1) Problem & unit test suite
+# ----------------------------
+TWO_SUM_DESC = textwrap.dedent("""
+Given an array of integers nums and an integer target, return indices [i, j]
+of the two numbers such that they add up to target. Each input has exactly one solution.
+You may not use the same element twice. Return indices in any order.
+""").strip()
+
+# Test cases (order of indices does not matter)
+TWO_SUM_TESTS = [
+    {"input": ([2,7,11,15], 9), "expected_any": [{0,1}]},
+    {"input": ([3,2,4], 6),     "expected_any": [{1,2}]},
+    {"input": ([3,3], 6),       "expected_any": [{0,1}]},
+    {"input": ([0,4,3,0], 0),   "expected_any": [{0,3}]},
+    {"input": ([-1,-2,-3,-4,-5], -8), "expected_any": [{2,4}, {1,3}]},  # allow either valid pair
+]
+
+# -------------------------------------------------------
+# 2) Prompt styles (all enforce “output ONLY one codeblock”
+#    and the exact function signature to make parsing easy)
+# -------------------------------------------------------
+STRICT_SPEC = textwrap.dedent("""
+Implement EXACTLY this function in Python:
+
+def twoSum(nums: list[int], target: int) -> list[int]:
+    \"\"\"
+    Return indices [i, j] such that nums[i] + nums[j] == target.
+    - No input() or prints
+    - No class; top-level function only
+    - Return a list of two indices
+    - O(n) expected
+    \"\"\"
+
+Only output a single Python code block with the function.
+""").strip()
+
+def prompt_v1_basic(problem: str) -> str:
+    return (
+        f"### Problem\n{problem}\n\n"
+        "Write the solution in Python with helpful inline comments.\n\n"
+        f"{STRICT_SPEC}\n"
+    )
+
+def prompt_v2_docstring(problem: str) -> str:
+    return (
+        f"### Problem\n{problem}\n\n"
+        "Write the solution in Python with a clear docstring and concise inline comments.\n\n"
+        f"{STRICT_SPEC}\n"
+    )
+
+def prompt_v3_plan_then_code(problem: str) -> str:
+    return (
+        f"### Problem\n{problem}\n\n"
+        "First reason briefly (internally). Then output ONLY the code block.\n"
+        "Do not include your reasoning in the final output.\n\n"
+        f"{STRICT_SPEC}\n"
+    )
+
+PROMPTS = {
+    "v1_basic": prompt_v1_basic(TWO_SUM_DESC),
+    "v2_docstring": prompt_v2_docstring(TWO_SUM_DESC),
+    "v3_plan_then_code": prompt_v3_plan_then_code(TWO_SUM_DESC),
+}
+
+# ------------------------------
+# 3) LLM generation helpers
+# ------------------------------
+def generate_code(prompt: str, max_new_tokens: int = 300, temperature: float = 0.2) -> str:
+    """Call the model and return raw decoded text."""
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    return tokenizer.decode(out[0], skip_special_tokens=True)
+
+def extract_code_block(text: str) -> str:
+    """
+    Extract the first ```python ... ``` block. If none, try to grab the def twoSum(...) chunk.
+    """
+    fence = re.search(r"```python(.*?)```", text, flags=re.S|re.I)
+    if fence:
+        return fence.group(1).strip()
+    # Fallback: find def twoSum(...) until end
+    m = re.search(r"(def\s+twoSum\s*\(.*?\)\s*:[\s\S]+)", text)
+    return m.group(1).strip() if m else text.strip()
+
+# ------------------------------------
+# 4) Static analysis for code comments
+# ------------------------------------
+def analyze_comments(code: str) -> Dict[str, float]:
+    lines = [ln for ln in code.splitlines()]
+    non_empty = [ln for ln in lines if ln.strip()]
+    num_non_empty = max(1, len(non_empty))
+
+    num_comment_lines = sum(1 for ln in non_empty if ln.strip().startswith("#"))
+    has_docstring = bool(re.search(r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'', code))
+
+    return {
+        "loc": len(non_empty),
+        "comment_lines": num_comment_lines,
+        "comment_density": num_comment_lines / num_non_empty,
+        "has_docstring": has_docstring,
+    }
+
+# ------------------------------
+# 5) Execution & unit test runner
+# ------------------------------
+def run_two_sum(code: str, tests: List[Dict]) -> Tuple[float, str]:
+    """
+    Execute user's code in a sandbox namespace and run unit tests.
+    Returns (pass_rate, error_report).
+    """
+    ns = {}
+    try:
+        exec(code, ns)
+    except Exception as e:
+        return 0.0, f"Compilation error: {type(e).__name__}: {e}"
+
+    if "twoSum" not in ns or not callable(ns["twoSum"]):
+        return 0.0, "Function twoSum not found."
+
+    func = ns["twoSum"]
+    passed = 0
+    detail_errors = []
+
+    for t in tests:
+        args = t["input"]
+        expected_any_sets = [set(pair) for pair in t["expected_any"]]
+        try:
+            out = func(*args)
+        except Exception as e:
+            detail_errors.append(f"Runtime error on input {args}: {type(e).__name__}: {e}")
+            continue
+
+        if not isinstance(out, list) or len(out) != 2:
+            detail_errors.append(f"Invalid output type/shape on {args}: got {out}")
+            continue
+
+        if set(out) in expected_any_sets:
+            passed += 1
+        else:
+            detail_errors.append(f"Wrong answer on {args}: got {out}, expected one of {t['expected_any']}")
+
+    pass_rate = passed / len(tests)
+    error_report = "OK" if passed == len(tests) else "\n".join(detail_errors[:5])
+    return pass_rate, error_report
+
+# ---------------------------------------
+# 6) One-step self-refinement if tests fail
+# ---------------------------------------
+def refine_code(problem: str, previous_code: str, error_report: str, temperature: float = 0.2) -> str:
+    refinement_prompt = textwrap.dedent(f"""
+    You previously produced a solution for the problem below, but tests failed.
+
+    ### Problem
+    {problem}
+
+    ### Your previous code
+    ```python
+    {previous_code}
+    ```
+
+    ### Test feedback (first errors)
+    {error_report}
+
+    Please provide a corrected implementation.
+    {STRICT_SPEC}
+    """).strip()
+
+    raw = generate_code(refinement_prompt, temperature=temperature)
+    return extract_code_block(raw)
+
+# -----------------------------------------
+# 7) Run all styles & collect the metrics
+# -----------------------------------------
+records = []
+
+for label, prompt in PROMPTS.items():
+    print(f"\n=== Evaluating: {label} ===")
+
+    # initial generation
+    raw_text = generate_code(prompt, temperature=0.2)
+    gen_code = extract_code_block(raw_text)
+    gen_static = analyze_comments(gen_code)
+    gen_pass, gen_err = run_two_sum(gen_code, TWO_SUM_TESTS)
+
+    # attempt one refinement if not perfect
+    if gen_pass < 1.0:
+        ref_code = refine_code(TWO_SUM_DESC, gen_code, gen_err, temperature=0.2)
+        ref_static = analyze_comments(ref_code)
+        ref_pass, ref_err = run_two_sum(ref_code, TWO_SUM_TESTS)
+    else:
+        ref_code = gen_code
+        ref_static = gen_static
+        ref_pass = gen_pass
+        ref_err = "OK"
+
+    print(f"Initial  — pass_rate: {gen_pass:.2f} | comment_density: {gen_static['comment_density']:.3f}")
+    print(f"Refined  — pass_rate: {ref_pass:.2f} | comment_density: {ref_static['comment_density']:.3f}")
+
+    records.append({
+        "prompt": label,
+
+        "gen_loc": gen_static["loc"],
+        "gen_comment_lines": gen_static["comment_lines"],
+        "gen_comment_density": round(gen_static["comment_density"], 6),
+        "gen_has_docstring": gen_static["has_docstring"],
+        "gen_pass_rate": round(gen_pass, 3),
+        "gen_error_head": gen_err if gen_err == "OK" else gen_err.split("\n")[0],
+
+        "ref_loc": ref_static["loc"],
+        "ref_comment_lines": ref_static["comment_lines"],
+        "ref_comment_density": round(ref_static["comment_density"], 6),
+        "ref_has_docstring": ref_static["has_docstring"],
+        "ref_pass_rate": round(ref_pass, 3),
+        "ref_error_head": ref_err if ref_err == "OK" else ref_err.split("\n")[0],
+    })
+
+df = pd.DataFrame.from_records(records)
+print("\n=== Metrics summary ===")
+display(df)
+
+# Save CSV for your paper/report
+csv_path = "metrics_summary_two_sum.csv"
+df.to_csv(csv_path, index=False)
+print(f"Saved: {csv_path}")
+
+# -----------------------------
+# 8) Visualization (two charts)
+# -----------------------------
+plt.figure(figsize=(7, 4))
+x = range(len(df))
+plt.bar([i-0.2 for i in x], df["gen_pass_rate"], width=0.4, label="Initial")
+plt.bar([i+0.2 for i in x], df["ref_pass_rate"], width=0.4, label="Refined")
+plt.xticks(list(x), df["prompt"], rotation=15)
+plt.ylabel("Pass rate")
+plt.title("Initial vs Refined pass rate (Two Sum)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(7, 4))
+plt.bar([i-0.2 for i in x], df["gen_comment_density"], width=0.4, label="Initial")
+plt.bar([i+0.2 for i in x], df["ref_comment_density"], width=0.4, label="Refined")
+plt.xticks(list(x), df["prompt"], rotation=15)
+plt.ylabel("Comment density (comments/line)")
+plt.title("Initial vs Refined comment density")
+plt.legend()
+plt.tight_layout()
+plt.show()
