@@ -14,8 +14,8 @@ Metrics: pass rate, comment density, docstring presence
 Visualizations comparing prompt performance
 
 File Structure
-code (18).ipynb          # Main notebook: generation, refinement, metrics, visualization
-self_refinement (2).py   # Self-refinement logic as a standalone script
+code (23).ipynb          # Main notebook: generation, refinement, metrics, visualization
+self_refinement (3).py   # Self-refinement logic as a standalone script
 archive/                 # Deprecated or earlier versions
 README.md                # Project documentation
 
